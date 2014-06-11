@@ -13,6 +13,7 @@ import socket
 import ssl
 import re
 import select
+import traceback
 
 if sys.version_info[0] == 3:
     from queue import Queue, Empty
@@ -93,19 +94,26 @@ class my_ssl_wrap(object):
     def initsslcxt():
         if my_ssl_wrap.ssl_cxt is not None:
             return
-        my_ssl_wrap.ssl_cxt_lock.acquire()
-        if my_ssl_wrap.ssl_cxt is not None:
-            return
-        my_ssl_wrap.ssl_cxt = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
-        my_ssl_wrap.ssl_cxt.set_timeout(g_commtimeout)
-        PRINT("init ssl context ok")
-        my_ssl_wrap.ssl_cxt_lock.release()
+        try:
+            my_ssl_wrap.ssl_cxt_lock.acquire()
+            if my_ssl_wrap.ssl_cxt is not None:
+                return
+            my_ssl_wrap.ssl_cxt = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+            my_ssl_wrap.ssl_cxt.set_timeout(g_commtimeout)
+            PRINT("init ssl context ok")
+        except Exception:
+            raise
+        finally:
+            my_ssl_wrap.ssl_cxt_lock.release()
 
     def getssldomain(self, threadname, ip):
         time_begin = time.time()
+        s = None
+        c = None
+        haserror = 1
         try:
             s = socket.socket()
-            PRINT("[%s]try connect to %s " % (threadname, ip))
+            #PRINT("[%s]try connect to %s " % (threadname, ip))
             if g_useOpenSSL:
                 my_ssl_wrap.initsslcxt()
                 s.settimeout(g_commtimeout)
@@ -122,7 +130,11 @@ class my_ssl_wrap(object):
                         if len(infds) == 0:
                             raise SSLError("do_handshake timeout")
                         else:
-                            pass
+                            costtime = int( time.time() - time_begin)
+                            if costtime > g_commtimeout:
+                                raise SSLError("do_handshake timeout")
+                            else:
+                                pass
                     except OpenSSL.SSL.SysCallError as e:
                         raise SSLError(e.args)
                 cert = c.get_peer_certificate()
@@ -132,12 +144,9 @@ class my_ssl_wrap(object):
                     if subject[0] == "CN":
                         domain = subject[1]
                         PRINT("[%s]ip: %s,CN: %s " % (threadname, ip, domain))
-                        c.shutdown()
-                        s.close()
+                        haserror = 0
                         return domain, costtime
                 PRINT("[%s]%s can not get CN: %s " % (threadname, ip, cert.get_subject().get_components()))
-                c.shutdown()
-                s.close()
                 return None, costtime
             else:
                 s.settimeout(g_commtimeout)
@@ -165,14 +174,11 @@ class my_ssl_wrap(object):
                                 else:
                                     domain = item[1]
                                 PRINT("[%s]ip: %s,CN: %s " % (threadname, ip, domain))
-                                c.shutdown(2)
-                                s.close()
+                                haserror = 0
                                 return domain, costtime
                     PRINT("[%s]%s can not get commonName: %s " % (threadname, ip, subjectitems))
                 else:
                     PRINT("[%s]%s can not get subject: %s " % (threadname, ip, cert))
-                c.shutdown(2)
-                s.close()
                 return None, costtime
         except SSLError as e:
             time_end = time.time()
@@ -184,6 +190,27 @@ class my_ssl_wrap(object):
             costtime = int(time_end * 1000 - time_begin * 1000)
             PRINT("[%s]Catch IO Exception(%s): %s, times:%d ms " % (threadname, ip, e, costtime))
             return None, costtime
+        except Exception as e:
+            time_end = time.time()
+            costtime = int(time_end * 1000 - time_begin * 1000)
+            PRINT("[%s]Catch Exception(%s): %s, times:%d ms " % (threadname, ip, e, costtime))
+            return None, costtime
+        finally:
+            if g_useOpenSSL:
+                if c:
+                    if haserror == 0:
+                        c.shutdown()
+                        c.sock_shutdown(2)
+                    c.close()
+                if s:
+                    s.close()
+            else:
+                if c:
+                    if haserror == 0:
+                        c.shutdown(2)
+                    c.close()
+                elif s:
+                    s.close()
 
 
 class Ping(threading.Thread):
@@ -191,14 +218,14 @@ class Ping(threading.Thread):
     ncount_lock = threading.Lock()
     def __init__(self):
         threading.Thread.__init__(self)
-        Ping.ncount += 1
 
     def runJob(self):
         while not g_ready.is_set():
             g_ready.wait(5)
         while not g_finish.is_set() and g_queue.qsize() > 0:
             try:
-                ipaddr = g_queue.get_nowait()
+                addrint = g_queue.get_nowait()
+                ipaddr = to_string(addrint)
                 g_queue.task_done()
                 ssl_obj = my_ssl_wrap()
                 (ssldomain, costtime) = ssl_obj.getssldomain(self.getName(), ipaddr)
@@ -214,6 +241,9 @@ class Ping(threading.Thread):
             time.sleep(0.0001)
     def run(self):
         try:
+            Ping.ncount_lock.acquire()
+            Ping.ncount += 1
+            Ping.ncount_lock.release()
             self.runJob()
         except Exception:
             raise
@@ -275,6 +305,15 @@ def splitip(strline):
 
     return begin, end
 
+def dumpstacks():
+    code = []
+    for threadId, stack in sys._current_frames().items():
+        code.append("\n# Thread: %d" % (threadId))
+        for filename, lineno, name, line in traceback.extract_stack(stack):
+            code.append('File: "%s", line %d, in %s' % (filename, lineno, name))
+            if line:
+                code.append("  %s" % (line.strip()))
+    sys.stderr.write("\n".join(code))
 
 def list_ping():
     if g_useOpenSSL == 1:
@@ -297,9 +336,10 @@ def list_ping():
             nbegin = from_string(begin)
             nend = from_string(end)
             while nbegin <= nend:
-                g_queue.put(to_string(nbegin))
+                g_queue.put(nbegin)
                 nbegin += 1
 
+    threading.stack_size(96*1024)
     qsize = g_queue.qsize()
     maxthreads = qsize if qsize < g_maxthreads else g_maxthreads
     PRINT('need create max threads count: %d,total ip cnt: %d ' % (maxthreads, qsize))
@@ -309,19 +349,31 @@ def list_ping():
         try:
             ping_thread.start()
         except threading.ThreadError as e:
-            PRINT('start new thread except: %s  ' % (e))
+            PRINT('start new thread except: %s,work thread cnt: %d' % (e, Ping.ncount))
             "can not create new thread"
             break
         threadlist.append(ping_thread)
     g_ready.set()
     try:
-        while Ping.ncount != 0:
+        time_begin = time.time()
+        lastcount = Ping.ncount
+        while Ping.ncount > 0:
             g_finish.wait(1)
+            time_end = time.time()
+            if lastcount != Ping.ncount or g_queue.qsize() > 0:
+                time_begin = time_end
+                lastcount = Ping.ncount
+            else:
+                if time_end - time_begin > g_commtimeout * 3:
+                    dumpstacks()
+                    break;
+                else:
+                    time_begin = time_end
         g_finish.set()
     except KeyboardInterrupt:
         g_finish.set()
-        for thread in threadlist:
-            thread.join()
+        #for thread in threadlist:
+        #   thread.join()
 
     ip_list.sort()
 
